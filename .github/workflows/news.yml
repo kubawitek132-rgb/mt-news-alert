@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      send_test:
+        description: "Wyślij testową wiadomość do Telegrama"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: mt-news-alert
@@ -37,6 +43,7 @@ jobs:
           TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
           TIMEZONE: Europe/Warsaw
           STATE_DB: stan.db
+          NEWS_TEST_MODE: ${{ inputs.send_test || 'false' }}
         run: python bot.py
 
       - name: Zapisz stan alertów
