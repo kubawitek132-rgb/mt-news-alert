@@ -29,7 +29,7 @@ jobs:
           python-version: "3.12"
 
       - name: Zainstaluj wymagania
-        run: pip install -r wymagania.txt
+        run: pip install -r requirements.txt
 
       - name: Uruchom bota
         env:
