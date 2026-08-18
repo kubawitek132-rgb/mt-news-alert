@@ -1,86 +1,151 @@
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, time
 from zoneinfo import ZoneInfo
 
 import requests
 
+# ============================================================
+# ABOUT MARKET MT BOT — FINAL XAUUSD LOGIC
+#
+# DATA:
+#   Twelve Data — XAU/USD
+#
+# TIMEZONE:
+#   Europe/Warsaw
+#
+# PREVIOUS / DAILY RANGE:
+#   A trading day is explicitly defined as:
+#       23:00 Warsaw -> next day 23:00 Warsaw
+#
+#   The day label is the calendar date on which that 23:00 close occurs.
+#   Example:
+#       14 Aug 23:00 -> 15 Aug 23:00 = trading day "15 Aug"
+#
+#   Monday:
+#       Previous trading day = Friday
+#
+# SESSIONS (independent from Previous Day):
+#   Asia      01:00-08:00 Warsaw
+#   London    09:00-13:00 Warsaw
+#   New York  14:00-18:00 Warsaw
+#
+# INTRADAY:
+#   - London watches current-day Asia High/Low
+#   - New York watches current-day London High/Low
+#   - Equilibrium zone uses Previous Trading Day Equilibrium
+#   - Previous Day High/Low breakout requires a completed 15m close
+#
+# WEEKENDS:
+#   Saturday/Sunday are ignored completely.
+# ============================================================
+
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 THREAD_ID = int(os.environ["TELEGRAM_MESSAGE_THREAD_ID"])
+TWELVE_API_KEY = os.environ["TWELVE_DATA_API_KEY"]
+# Trading Economics calendar API key.  This is intentionally optional so an
+# unavailable calendar provider never stops the XAUUSD market report.
+TRADING_ECONOMICS_API_KEY = os.getenv("TRADING_ECONOMICS_API_KEY", "").strip()
+
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Warsaw"))
+SYMBOL = os.getenv("XAU_SYMBOL", "XAU/USD")
+DB = "about_market_state.db"
 
-CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-
-CURRENCIES = {"USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD"}
-IMPACTS = {"Medium", "High"}
-
-# GitHub Actions runs every 5 minutes.
-# Windows are intentionally tolerant of runner/API delays.
-ALERT_WINDOWS = {
-    "30": (27, 33),
-    "15": (12, 18),
-    "5": (2, 8),
+SESSIONS = {
+    "ASIA": (1, 8),
+    "LONDON": (9, 13),
+    "NEW YORK": (14, 18),
 }
 
-DB = "state.db"
 
-
-# ----------------------------
-# Database / state
-# ----------------------------
-
+# -----------------------------
+# State
+# -----------------------------
 def db_connect():
     con = sqlite3.connect(DB)
+
     con.execute("""
-        CREATE TABLE IF NOT EXISTS sent_alerts (
+        CREATE TABLE IF NOT EXISTS daily_reports (
+            market_day TEXT PRIMARY KEY,
+            sent_at TEXT NOT NULL
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS level_alerts (
+            market_day TEXT NOT NULL,
+            level_name TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY (market_day, level_name, direction)
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS equilibrium_zone_state (
+            market_day TEXT PRIMARY KEY,
+            inside_zone INTEGER NOT NULL DEFAULT 0,
+            last_price REAL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS session_breakout_state (
+            market_day TEXT PRIMARY KEY,
+            last_price REAL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS session_breakout_alerts (
+            market_day TEXT NOT NULL,
+            current_session TEXT NOT NULL,
+            reference_session TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY (
+                market_day,
+                current_session,
+                reference_session,
+                direction
+            )
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS market_idea_alerts (
+            market_day TEXT NOT NULL,
+            setup_key TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY (market_day, setup_key)
+        )
+    """)
+
+    # One row per event and alert type keeps a five-minute polling workflow
+    # from re-sending the same calendar notification.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS economic_calendar_alerts (
             event_key TEXT NOT NULL,
             alert_type TEXT NOT NULL,
             sent_at TEXT NOT NULL,
             PRIMARY KEY (event_key, alert_type)
         )
     """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS event_snapshots (
-            event_key TEXT PRIMARY KEY,
-            forecast TEXT,
-            previous TEXT,
-            actual TEXT,
-            updated_at TEXT NOT NULL
-        )
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS released_events (
-            event_key TEXT PRIMARY KEY,
-            released_at TEXT NOT NULL
-        )
-    """)
+
     con.commit()
     return con
 
 
-def was_sent(con, event_key, alert_type):
-    return con.execute(
-        "SELECT 1 FROM sent_alerts WHERE event_key=? AND alert_type=?",
-        (event_key, alert_type),
-    ).fetchone() is not None
-
-
-def mark_sent(con, event_key, alert_type):
-    con.execute(
-        "INSERT OR IGNORE INTO sent_alerts VALUES (?, ?, ?)",
-        (event_key, alert_type, datetime.now(timezone.utc).isoformat()),
-    )
-    con.commit()
-
-
-# ----------------------------
+# -----------------------------
 # Telegram
-# ----------------------------
-
+# -----------------------------
 def telegram_send(text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    response = requests.post(
+
+    r = requests.post(
         url,
         json={
             "chat_id": CHAT_ID,
@@ -90,534 +155,1348 @@ def telegram_send(text):
         },
         timeout=20,
     )
-    response.raise_for_status()
+
+    if not r.ok:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise RuntimeError(f"Telegram sendMessage failed: {detail}")
+
+    return r.json()
 
 
-# ----------------------------
-# Calendar parsing
-# ----------------------------
+# -----------------------------
+# Economic calendar / XAUUSD news alerts
+# -----------------------------
+NEWS_COUNTRY = "United States"
+NEWS_PRE_ALERT_MINUTES = 20
+NEWS_RELEASE_LOOKBACK_MINUTES = 180
 
-def parse_datetime(raw):
-    value = raw.get("date")
+
+def _calendar_value(value):
+    """Return a compact printable calendar value, or N/A when unavailable."""
+    if value is None or str(value).strip().lower() in {"", "null", "none", "-"}:
+        return "N/A"
+    return str(value).strip()
+
+
+def _calendar_datetime(value):
+    """Parse Trading Economics' ISO timestamp and return it in Warsaw time."""
     if not value:
         return None
+
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except Exception:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
         return None
 
+    # Trading Economics timestamps are UTC.  Keep this fallback explicit for
+    # timestamp values that do not include an offset.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
 
-def normalize(raw):
-    dt = parse_datetime(raw)
-    if not dt:
-        return None
-
-    impact = str(raw.get("impact") or "").strip().title()
-    currency = str(raw.get("country") or "").strip().upper()
-    title = str(raw.get("title") or "").strip()
-
-    if impact not in IMPACTS:
-        return None
-
-    if currency not in CURRENCIES:
-        return None
-
-    if not title:
-        return None
-
-    return {
-        "dt": dt,
-        "currency": currency,
-        "impact": impact,
-        "title": title,
-        "forecast": str(raw.get("forecast") or "").strip(),
-        "previous": str(raw.get("previous") or "").strip(),
-        "actual": str(raw.get("actual") or "").strip(),
-    }
+    return parsed.astimezone(TZ)
 
 
-def event_key(e):
-    return (
-        f'{e["dt"].isoformat()}|{e["currency"]}|'
-        f'{e["title"]}|{e["impact"]}'
+def _is_high_impact(event):
+    importance = event.get("Importance", event.get("importance"))
+    if isinstance(importance, (int, float)):
+        return importance >= 3
+    return str(importance or "").strip().lower() in {"high", "3", "3.0"}
+
+
+def _calendar_event_key(event, event_dt):
+    return "|".join(
+        (
+            event_dt.astimezone(timezone.utc).isoformat(),
+            str(event.get("Country", event.get("country", ""))).strip(),
+            str(event.get("Event", event.get("event", ""))).strip(),
+        )
     )
 
 
-# ----------------------------
-# XAUUSD relevance engine
-# ----------------------------
-
-# Score 5 = major gold driver
-# Score 4 = strong potential driver
-# Score 3 = meaningful but less direct
-# Score <3 = ignored
-
-def xau_relevance(e):
-    title = e["title"].lower()
-    currency = e["currency"]
-    impact = e["impact"]
-
-    score = 0
-    reasons = []
-
-    # USD events are the core of the filter.
-    if currency == "USD":
-        if any(k in title for k in [
-            "cpi", "consumer price index",
-            "pce price", "core pce",
-            "federal funds rate", "interest rate decision",
-            "fed interest rate", "fomc",
-            "powell", "fed chair", "federal reserve",
-        ]):
-            score = 5
-            reasons.append("inflation / Fed / rates")
-
-        elif any(k in title for k in [
-            "non-farm", "nonfarm", "non farm", "nfp",
-            "unemployment rate",
-            "average hourly earnings",
-        ]):
-            score = 5
-            reasons.append("US labor market")
-
-        elif any(k in title for k in [
-            "ppi", "producer price index",
-            "retail sales", "core retail sales",
-            "ism manufacturing", "ism services",
-            "ism non-manufacturing",
-        ]):
-            score = 4
-            reasons.append("US inflation / demand / activity")
-
-        elif any(k in title for k in [
-            "jobless claims", "unemployment claims",
-            "initial claims", "continuing claims",
-            "gdp", "gross domestic product",
-            "consumer confidence",
-            "durable goods",
-            "manufacturing pmi", "services pmi",
-            "jolts",
-        ]):
-            score = 3
-            reasons.append("US growth / labor / sentiment")
-
-        elif any(k in title for k in [
-            "fomc member", "fed member",
-            "treasury", "bond auction",
-        ]):
-            score = 3
-            reasons.append("rates / yields / Fed")
-
-        # Medium USD events can still cause an unexpected move.
-        elif impact == "Medium":
-            score = 3
-            reasons.append("USD medium-impact event")
-
-    # Selected non-USD central-bank events can affect global rates/risk
-    # and therefore gold. Keep these selective.
-    if currency in {"EUR", "GBP", "JPY", "CHF"}:
-        if any(k in title for k in [
-            "interest rate decision", "interest rate",
-            "central bank", "monetary policy",
-            "ecb", "boe", "boj", "snB", "snb",
-            "press conference", "rate statement",
-        ]):
-            score = max(score, 4)
-            reasons.append("central-bank / rates event")
-
-    # Very broad risk events can matter, but do not automatically qualify
-    # every foreign macro release.
-    if any(k in title for k in [
-        "geopolitical", "war", "emergency",
-    ]):
-        score = max(score, 4)
-        reasons.append("risk / geopolitical")
-
-    # High-impact non-USD macro events can be a secondary gold driver,
-    # but only when the title looks like a major macro release.
-    if impact == "High" and currency != "USD":
-        if any(k in title for k in [
-            "gdp", "inflation", "cpi", "ppi",
-            "employment", "unemployment",
-            "interest rate", "central bank",
-        ]):
-            score = max(score, 3)
-            reasons.append("major global macro")
-
-    return score, reasons
+def calendar_alert_already_sent(con, event_key, alert_type):
+    return con.execute(
+        """
+        SELECT 1 FROM economic_calendar_alerts
+        WHERE event_key=? AND alert_type=?
+        """,
+        (event_key, alert_type),
+    ).fetchone() is not None
 
 
-def should_alert_xau(e):
-    score, reasons = xau_relevance(e)
-    return score >= 3, score, reasons
-
-
-# ----------------------------
-# Market bias
-# ----------------------------
-
-def rule_for(title, currency):
-    t = title.lower()
-
-    if currency == "USD" and any(k in t for k in [
-        "cpi", "consumer price index",
-        "pce price", "core pce",
-    ]):
-        return (
-            "inflation",
-            ["USD ↑", "XAUUSD ↓", "US indices ↓"],
-            ["USD ↓", "XAUUSD ↑", "US indices ↑"],
-        )
-
-    if currency == "USD" and any(k in t for k in [
-        "federal funds rate", "interest rate decision",
-        "fed interest rate", "fomc",
-        "powell", "fed chair", "federal reserve",
-    ]):
-        return (
-            "rates",
-            ["USD ↑", "XAUUSD ↓", "US indices ↓"],
-            ["USD ↓", "XAUUSD ↑", "US indices ↑"],
-        )
-
-    if currency == "USD" and any(k in t for k in [
-        "non-farm", "nonfarm", "non farm", "nfp",
-        "unemployment rate", "average hourly earnings",
-    ]):
-        return (
-            "labor market",
-            ["USD ↑", "XAUUSD ↓", "US indices ↓"],
-            ["USD ↓", "XAUUSD ↑", "US indices ↑"],
-        )
-
-    if currency == "USD" and any(k in t for k in [
-        "ppi", "producer price index",
-        "retail sales", "core retail sales",
-        "ism manufacturing", "ism services",
-    ]):
-        return (
-            "US inflation / activity",
-            ["USD ↑", "XAUUSD ↓", "US indices may ↓"],
-            ["USD ↓", "XAUUSD ↑", "US indices may ↑"],
-        )
-
-    if currency == "USD" and any(k in t for k in [
-        "jobless claims", "unemployment claims",
-        "initial claims", "continuing claims",
-        "gdp", "gross domestic product",
-        "consumer confidence", "durable goods",
-        "jolts",
-    ]):
-        return (
-            "US macro",
-            ["USD ↑", "XAUUSD ↓"],
-            ["USD ↓", "XAUUSD ↑"],
-        )
-
-    if "gdp" in t or "gross domestic product" in t:
-        return (
-            "growth",
-            [f"{currency} ↑", "Gold reaction can be mixed"],
-            [f"{currency} ↓", "Gold reaction can be mixed"],
-        )
-
-    if any(k in t for k in [
-        "interest rate", "central bank", "monetary policy",
-        "ecb", "boe", "boj", "snb",
-    ]):
-        return (
-            "global rates",
-            [f"{currency} ↑", "Gold may face pressure if global yields rise"],
-            [f"{currency} ↓", "Gold may benefit if global yields fall"],
-        )
-
-    return None
-
-
-def bias_text(title, currency):
-    rule = rule_for(title, currency)
-
-    if not rule:
-        return (
-            "🧭 MT GOLD BIAS\n\n"
-            "⚪ No clean directional rule for this event.\n"
-            "Watch the actual-vs-forecast surprise and price reaction.\n\n"
-            "⚠️ Scenario, not a prediction."
-        )
-
-    _, higher, lower = rule
-
-    return (
-        "🧭 MT GOLD BIAS\n\n"
-        "📈 If ACTUAL > FORECAST:\n"
-        + "\n".join("• " + x for x in higher)
-        + "\n\n"
-        "📉 If ACTUAL < FORECAST:\n"
-        + "\n".join("• " + x for x in lower)
-        + "\n\n"
-        "⚠️ Scenario, not a prediction."
+def mark_calendar_alert_sent(con, event_key, alert_type):
+    con.execute(
+        """
+        INSERT OR IGNORE INTO economic_calendar_alerts
+        VALUES (?, ?, ?)
+        """,
+        (event_key, alert_type, datetime.now(timezone.utc).isoformat()),
     )
+    con.commit()
 
 
-def release_direction(e):
-    rule = rule_for(e["title"], e["currency"])
-    if not rule:
-        return "⚪ No clean directional rule — watch the price reaction."
+def fetch_us_economic_calendar(now):
+    """Fetch a rolling UTC window so delayed workflow starts remain covered."""
+    if not TRADING_ECONOMICS_API_KEY:
+        return []
 
-    a = to_number(e["actual"])
-    f = to_number(e["forecast"])
-
-    if a is None or f is None:
-        return "⚪ Actual/Forecast is not numeric — watch the price reaction."
-
-    _, higher, lower = rule
-
-    if a > f:
-        return (
-            "📈 ACTUAL > FORECAST\n"
-            + "\n".join("• " + x for x in higher)
-        )
-
-    if a < f:
-        return (
-            "📉 ACTUAL < FORECAST\n"
-            + "\n".join("• " + x for x in lower)
-        )
-
-    return "⚪ ACTUAL = FORECAST\n• Directional edge is unclear."
-
-
-def to_number(value):
-    try:
-        return float(
-            str(value)
-            .replace("%", "")
-            .replace(",", "")
-            .strip()
-        )
-    except Exception:
-        return None
-
-
-# ----------------------------
-# Formatting
-# ----------------------------
-
-def flag(currency):
-    return {
-        "USD": "🇺🇸",
-        "EUR": "🇪🇺",
-        "GBP": "🇬🇧",
-        "JPY": "🇯🇵",
-        "AUD": "🇦🇺",
-        "CAD": "🇨🇦",
-        "CHF": "🇨🇭",
-        "NZD": "🇳🇿",
-    }.get(currency, "🌍")
-
-
-def impact_icon(impact):
-    return "🔴" if impact == "High" else "🟠"
-
-
-def relevance_icon(score):
-    if score >= 5:
-        return "🔥"
-    if score >= 4:
-        return "🟠"
-    return "🟡"
-
-
-def relevance_text(score, reasons):
-    reason_text = ", ".join(reasons[:2]) if reasons else "market relevance"
-    return (
-        f"{relevance_icon(score)} XAUUSD RELEVANCE: {score}/5\n"
-        f"Why: {reason_text}"
-    )
-
-
-def pre_alert(e, minutes, score, reasons, update=False):
-    local = e["dt"].astimezone(TZ)
-
-    heading = (
-        "🔄 MT NEWS UPDATE"
-        if update
-        else "🚨 MT NEWS ALERT"
-    )
-
-    timing = (
-        "⚠️ DATA UPDATED"
-        if update
-        else f"⏱ NEWS IN {minutes} MIN"
-    )
-
-    return (
-        f"{heading}\n\n"
-        f"{flag(e['currency'])} {e['currency']} • "
-        f"{impact_icon(e['impact'])} {e['impact'].upper()} IMPACT\n\n"
-        f"📅 {e['title']}\n"
-        f"⏰ {local.strftime('%H:%M')} ({TZ.key})\n\n"
-        f"{relevance_text(score, reasons)}\n\n"
-        f"📊 Forecast: {e['forecast'] or '—'}\n"
-        f"📌 Previous: {e['previous'] or '—'}\n\n"
-        f"{timing}\n\n"
-        f"{bias_text(e['title'], e['currency'])}"
-    )
-
-
-def release_alert(e, score, reasons):
-    local = e["dt"].astimezone(TZ)
-
-    actual = e["actual"] or "—"
-    forecast = e["forecast"] or "—"
-    previous = e["previous"] or "—"
-
-    a = to_number(e["actual"])
-    f = to_number(e["forecast"])
-
-    if a is not None and f is not None:
-        surprise = f"{a - f:+g}"
-    else:
-        surprise = "Not calculated"
-
-    return (
-        "🔥 MT NEWS — RELEASED\n\n"
-        f"{flag(e['currency'])} {e['currency']} • "
-        f"{impact_icon(e['impact'])} {e['impact'].upper()} IMPACT\n\n"
-        f"📅 {e['title']}\n"
-        f"⏰ {local.strftime('%H:%M')} ({TZ.key})\n\n"
-        f"{relevance_text(score, reasons)}\n\n"
-        f"🔥 Actual: {actual}\n"
-        f"📊 Forecast: {forecast}\n"
-        f"📌 Previous: {previous}\n"
-        f"📐 Surprise: {surprise}\n\n"
-        f"🧭 MT GOLD BIAS\n\n"
-        f"{release_direction(e)}\n\n"
-        f"⚠️ Initial reaction ≠ guaranteed direction."
-    )
-
-
-# ----------------------------
-# Main
-# ----------------------------
-
-def main():
-    con = db_connect()
-    now = datetime.now(timezone.utc)
-
+    start = (now - timedelta(hours=3)).astimezone(timezone.utc).date().isoformat()
+    end = (now + timedelta(days=2)).astimezone(timezone.utc).date().isoformat()
     response = requests.get(
-        CALENDAR_URL,
-        headers={"User-Agent": "MT-News-Alerts/3.0"},
+        "https://api.tradingeconomics.com/calendar/country/united%20states/"
+        f"{start}/{end}",
+        params={"c": TRADING_ECONOMICS_API_KEY, "f": "json"},
         timeout=20,
     )
     response.raise_for_status()
     data = response.json()
+    if not isinstance(data, list):
+        raise RuntimeError(f"Unexpected calendar response: {data}")
+    return data
 
-    all_events = []
-    for raw in data:
-        event = normalize(raw)
-        if event:
-            all_events.append(event)
 
-    xau_events = []
-    for e in all_events:
-        qualifies, score, reasons = should_alert_xau(e)
-        if qualifies:
-            xau_events.append((e, score, reasons))
+def _upcoming_news_message(event, event_dt):
+    return (
+        "🔔 XAUUSD — UPCOMING HIGH-IMPACT USD NEWS\n\n"
+        f"🇺🇸 {_calendar_value(event.get('Event', event.get('event')))}\n"
+        f"⏰ {event_dt.strftime('%d %b %Y, %H:%M')} Europe/Warsaw\n"
+        f"📊 Forecast: {_calendar_value(event.get('Forecast', event.get('forecast')))}\n"
+        f"📌 Previous: {_calendar_value(event.get('Previous', event.get('previous')))}\n\n"
+        "🟡 XAUUSD relevance: high — expect elevated volatility."
+    )
 
-    pre_sent = 0
-    release_sent = 0
-    updates_sent = 0
 
-    for e, score, reasons in xau_events:
-        key = event_key(e)
-        delta_min = (e["dt"] - now).total_seconds() / 60.0
+def _released_news_message(event, event_dt):
+    return (
+        "📰 XAUUSD — HIGH-IMPACT USD DATA RELEASED\n\n"
+        f"🇺🇸 {_calendar_value(event.get('Event', event.get('event')))}\n"
+        f"⏰ {event_dt.strftime('%d %b %Y, %H:%M')} Europe/Warsaw\n"
+        f"✅ Actual: {_calendar_value(event.get('Actual', event.get('actual')))}\n"
+        f"📊 Forecast: {_calendar_value(event.get('Forecast', event.get('forecast')))}\n"
+        f"📌 Previous: {_calendar_value(event.get('Previous', event.get('previous')))}\n\n"
+        "🟡 Watch XAUUSD price action and USD reaction; this is not a trade signal."
+    )
 
-        # 30 / 15 / 5 minute alerts
-        for alert_type, (low, high) in ALERT_WINDOWS.items():
-            if low <= delta_min <= high:
-                if not was_sent(con, key, alert_type):
-                    telegram_send(
-                        pre_alert(e, alert_type, score, reasons)
-                    )
-                    mark_sent(con, key, alert_type)
-                    pre_sent += 1
 
-        # Detect a meaningful calendar update before release.
-        # We compare Forecast/Previous/Actual against the last snapshot.
-        previous_snapshot = con.execute(
-            "SELECT forecast, previous, actual FROM event_snapshots WHERE event_key=?",
-            (key,),
-        ).fetchone()
+def process_economic_calendar(con, now):
+    """Send one pre-release and one released-data alert for each relevant event."""
+    if not TRADING_ECONOMICS_API_KEY:
+        print("Economic calendar disabled: missing TRADING_ECONOMICS_API_KEY.")
+        return 0, 0
 
-        current_snapshot = (
-            e["forecast"],
-            e["previous"],
-            e["actual"],
+    upcoming_sent = 0
+    released_sent = 0
+    events = fetch_us_economic_calendar(now)
+
+    for event in events:
+        country = str(event.get("Country", event.get("country", ""))).strip()
+        event_dt = _calendar_datetime(event.get("Date", event.get("date")))
+        event_name = _calendar_value(event.get("Event", event.get("event")))
+        if country != NEWS_COUNTRY or not event_dt or event_name == "N/A":
+            continue
+        if not _is_high_impact(event):
+            continue
+
+        event_key = _calendar_event_key(event, event_dt)
+        minutes_until = (event_dt - now).total_seconds() / 60
+
+        if (
+            0 <= minutes_until <= NEWS_PRE_ALERT_MINUTES
+            and not calendar_alert_already_sent(con, event_key, "upcoming")
+        ):
+            telegram_send(_upcoming_news_message(event, event_dt))
+            mark_calendar_alert_sent(con, event_key, "upcoming")
+            upcoming_sent += 1
+
+        actual = _calendar_value(event.get("Actual", event.get("actual")))
+        if (
+            -NEWS_RELEASE_LOOKBACK_MINUTES <= minutes_until < 0
+            and actual != "N/A"
+            and not calendar_alert_already_sent(con, event_key, "released")
+        ):
+            telegram_send(_released_news_message(event, event_dt))
+            mark_calendar_alert_sent(con, event_key, "released")
+            released_sent += 1
+
+    return upcoming_sent, released_sent
+
+
+# -----------------------------
+# Twelve Data
+# -----------------------------
+def td_time_series(
+    interval,
+    start_dt=None,
+    end_dt=None,
+    outputsize=5000,
+):
+    url = "https://api.twelvedata.com/time_series"
+
+    params = {
+        "symbol": SYMBOL,
+        "interval": interval,
+        "outputsize": outputsize,
+        "timezone": "Europe/Warsaw",
+        "apikey": TWELVE_API_KEY,
+        "format": "JSON",
+    }
+
+    if start_dt is not None:
+        params["start_date"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    if end_dt is not None:
+        params["end_date"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    r = requests.get(url, params=params, timeout=25)
+    r.raise_for_status()
+
+    data = r.json()
+
+    if data.get("status") == "error":
+        raise RuntimeError(
+            f"Twelve Data API error: {data.get('message', data)}"
         )
 
-        if previous_snapshot is not None:
-            changed = previous_snapshot != current_snapshot
+    return data
 
-            # Only send updates while the event is still in the future.
-            # This prevents the release itself from generating an "update".
-            if changed and now < e["dt"]:
-                update_key = "UPDATE"
-                if not was_sent(con, key, update_key):
-                    telegram_send(
-                        pre_alert(
-                            e,
-                            "",
-                            score,
-                            reasons,
-                            update=True,
-                        )
-                    )
-                    mark_sent(con, key, update_key)
-                    updates_sent += 1
 
-        con.execute("""
-            INSERT INTO event_snapshots
-                (event_key, forecast, previous, actual, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(event_key) DO UPDATE SET
-                forecast=excluded.forecast,
-                previous=excluded.previous,
-                actual=excluded.actual,
-                updated_at=excluded.updated_at
-        """, (
-            key,
-            e["forecast"],
-            e["previous"],
-            e["actual"],
+def parse_candles(data):
+    values = data.get("values") or []
+    rows = []
+
+    for item in reversed(values):
+        dt = datetime.strptime(
+            item["datetime"],
+            "%Y-%m-%d %H:%M:%S",
+        ).replace(tzinfo=TZ)
+
+        rows.append(
+            {
+                "dt": dt,
+                "open": float(item["open"]),
+                "high": float(item["high"]),
+                "low": float(item["low"]),
+                "close": float(item["close"]),
+            }
+        )
+
+    return rows
+
+
+def load_5m_window(start_dt, end_dt):
+    return parse_candles(
+        td_time_series(
+            "5min",
+            start_dt=start_dt,
+            end_dt=end_dt,
+            outputsize=5000,
+        )
+    )
+
+
+# -----------------------------
+# Trading-day helpers
+# -----------------------------
+def previous_weekday(d):
+    d = d - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def trading_day_window(day_label):
+    """
+    Trading day labelled by its 23:00 closing date.
+
+    Example:
+      label Friday 15 Aug
+      start = Thursday 14 Aug 23:00
+      end   = Friday 15 Aug 23:00
+    """
+    start = datetime.combine(
+        day_label - timedelta(days=1),
+        time(23, 0),
+        tzinfo=TZ,
+    )
+    end = datetime.combine(
+        day_label,
+        time(23, 0),
+        tzinfo=TZ,
+    )
+    return start, end
+
+
+def session_window(day, start_hour, end_hour):
+    start = datetime.combine(
+        day,
+        time(start_hour, 0),
+        tzinfo=TZ,
+    )
+    end = datetime.combine(
+        day,
+        time(end_hour, 0),
+        tzinfo=TZ,
+    )
+    return start, end
+
+
+# -----------------------------
+# Range calculations
+# -----------------------------
+def range_from_rows(rows):
+    if not rows:
+        return None
+
+    high = max(r["high"] for r in rows)
+    low = min(r["low"] for r in rows)
+    close = rows[-1]["close"]
+
+    return {
+        "high": high,
+        "low": low,
+        "equilibrium": (high + low) / 2,
+        "close": close,
+    }
+
+
+def daily_range_for_label(day_label):
+    start, end = trading_day_window(day_label)
+    rows = load_5m_window(start, end)
+
+    # The end timestamp is the 23:00 boundary; the candle opening exactly
+    # at 23:00 belongs to the next trading day and must not be included.
+    rows = [r for r in rows if start <= r["dt"] < end]
+
+    result = range_from_rows(rows)
+    return result, rows
+
+
+def session_range_for_day(rows, day, name):
+    start_hour, end_hour = SESSIONS[name]
+
+    rows = [
+        r
+        for r in rows
+        if r["dt"].date() == day
+        and start_hour <= r["dt"].hour < end_hour
+    ]
+
+    return range_from_rows(rows)
+
+
+def all_sessions_for_day(rows, day):
+    return {
+        name: session_range_for_day(rows, day, name)
+        for name in ("ASIA", "LONDON", "NEW YORK")
+    }
+
+
+# -----------------------------
+# Trend
+# -----------------------------
+def trend_from_daily_ranges(days):
+    if len(days) < 3:
+        return "NEUTRAL", "Not enough completed trading days"
+
+    a, b, c = days[-3], days[-2], days[-1]
+
+    bullish = (
+        b["high"] >= a["high"]
+        and b["low"] >= a["low"]
+        and c["high"] >= b["high"]
+        and c["low"] >= b["low"]
+        and (c["high"] > a["high"] or c["low"] > a["low"])
+    )
+
+    bearish = (
+        b["high"] <= a["high"]
+        and b["low"] <= a["low"]
+        and c["high"] <= b["high"]
+        and c["low"] <= b["low"]
+        and (c["high"] < a["high"] or c["low"] < a["low"])
+    )
+
+    if bullish:
+        return "BULLISH", "Higher-high / higher-low structure"
+
+    if bearish:
+        return "BEARISH", "Lower-high / lower-low structure"
+
+    if c["close"] > b["close"] and c["close"] > c["equilibrium"]:
+        return "BULLISH", "Price above equilibrium with rising close"
+
+    if c["close"] < b["close"] and c["close"] < c["equilibrium"]:
+        return "BEARISH", "Price below equilibrium with falling close"
+
+    return "NEUTRAL", "Mixed structure"
+
+
+def trend_icon(trend):
+    return {
+        "BULLISH": "📈",
+        "BEARISH": "📉",
+        "NEUTRAL": "⚪",
+    }.get(trend, "⚪")
+
+
+# -----------------------------
+# Formatting / report
+# -----------------------------
+def fmt_price(value):
+    return f"{value:,.3f}"
+
+
+def session_text(sessions):
+    labels = {
+        "ASIA": "🌏 ASIA",
+        "LONDON": "🇬🇧 LONDON",
+        "NEW YORK": "🇺🇸 NEW YORK",
+    }
+
+    parts = []
+
+    for name in ("ASIA", "LONDON", "NEW YORK"):
+        parts.append(labels[name])
+
+        data = sessions.get(name)
+
+        if not data:
+            parts.append("🔺 HIGH: N/A")
+            parts.append("🔻 LOW: N/A")
+        else:
+            parts.append(f"🔺 HIGH: {fmt_price(data['high'])}")
+            parts.append(f"🔻 LOW: {fmt_price(data['low'])}")
+
+        parts.append("")
+
+    return "\n".join(parts).rstrip()
+
+
+def daily_message(day_label, previous_day, sessions, trend, reason):
+    return (
+        "🟡 XAUUSD — DAILY MARKET\n\n"
+        f"📅 PREVIOUS DAY: {day_label.strftime('%d %B %Y')}\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "📅 PREVIOUS DAY\n\n"
+        f"🔺 HIGH: {fmt_price(previous_day['high'])}\n"
+        f"🔻 LOW: {fmt_price(previous_day['low'])}\n\n"
+        f"⚖️ EQUILIBRIUM: {fmt_price(previous_day['equilibrium'])}\n\n"
+        f"{trend_icon(trend)} TREND: {trend}\n"
+        f"🧠 {reason}\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"{session_text(sessions)}\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "⚖️ EQUILIBRIUM = 50% BETWEEN PREVIOUS DAY HIGH & LOW"
+    )
+
+
+# -----------------------------
+# Daily report persistence
+# -----------------------------
+def send_daily_report(
+    con,
+    day_label,
+    previous_day,
+    sessions,
+    trend,
+    reason,
+):
+    if con.execute(
+        "SELECT 1 FROM daily_reports WHERE market_day=?",
+        (str(day_label),),
+    ).fetchone():
+        return False
+
+    telegram_send(
+        daily_message(
+            day_label,
+            previous_day,
+            sessions,
+            trend,
+            reason,
+        )
+    )
+
+    con.execute(
+        "INSERT INTO daily_reports VALUES (?, ?)",
+        (
+            str(day_label),
             datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+    con.commit()
+    return True
+
+
+# -----------------------------
+# Equilibrium zone
+# -----------------------------
+def check_equilibrium_zone(
+    con,
+    reference_day,
+    equilibrium,
+    price,
+):
+    lower = equilibrium - 1.0
+    inside = lower <= price <= equilibrium
+
+    row = con.execute(
+        "SELECT inside_zone FROM equilibrium_zone_state WHERE market_day=?",
+        (str(reference_day),),
+    ).fetchone()
+
+    was_inside = bool(row[0]) if row else False
+
+    if inside and not was_inside:
+        telegram_send(
+            "⚖️ XAUUSD — EQUILIBRIUM ZONE\n\n"
+            f"🎯 Equilibrium: {fmt_price(equilibrium)}\n"
+            f"📍 Current Price: {fmt_price(price)}\n"
+            f"📏 Zone: {fmt_price(lower)} — {fmt_price(equilibrium)}\n\n"
+            "Price has entered the $1 Equilibrium Zone."
+        )
+
+    con.execute(
+        """
+        INSERT INTO equilibrium_zone_state
+            (market_day, inside_zone, last_price, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(market_day) DO UPDATE SET
+            inside_zone=excluded.inside_zone,
+            last_price=excluded.last_price,
+            updated_at=excluded.updated_at
+        """,
+        (
+            str(reference_day),
+            int(inside),
+            price,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+    con.commit()
+
+    return 1 if inside and not was_inside else 0
+
+
+# -----------------------------
+# Session breakout alerts
+# -----------------------------
+def breakout_already_sent(
+    con,
+    day,
+    current_session,
+    reference_session,
+    direction,
+):
+    return con.execute(
+        """
+        SELECT 1
+        FROM session_breakout_alerts
+        WHERE market_day=?
+          AND current_session=?
+          AND reference_session=?
+          AND direction=?
+        """,
+        (
+            str(day),
+            current_session,
+            reference_session,
+            direction,
+        ),
+    ).fetchone() is not None
+
+
+def mark_breakout(
+    con,
+    day,
+    current_session,
+    reference_session,
+    direction,
+):
+    con.execute(
+        """
+        INSERT OR IGNORE INTO session_breakout_alerts
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            str(day),
+            current_session,
+            reference_session,
+            direction,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+    con.commit()
+
+
+def breakout_message(
+    current_session,
+    reference_session,
+    level_name,
+    level,
+    price,
+):
+    icons = {
+        "HIGH": "🚀",
+        "LOW": "🔻",
+    }
+
+    return (
+        f"{icons[level_name]} XAUUSD — SESSION BREAKOUT\n\n"
+        f"{current_session} SESSION\n"
+        f"📌 Broke {reference_session} {level_name}\n\n"
+        f"🎯 Level: {fmt_price(level)}\n"
+        f"💰 Current Price: {fmt_price(price)}\n\n"
+        "⚠️ Intraday market-structure update."
+    )
+
+
+def check_session_breakouts(
+    con,
+    day,
+    sessions,
+    current_price,
+    previous_price,
+    now,
+):
+    if current_price is None or previous_price is None:
+        return 0
+
+    hour = now.hour + now.minute / 60
+
+    if 9 <= hour < 13:
+        current_session = "LONDON"
+        reference_session = "ASIA"
+    elif 14 <= hour < 18:
+        current_session = "NEW YORK"
+        reference_session = "LONDON"
+    else:
+        return 0
+
+    reference = sessions.get(reference_session)
+
+    if not reference:
+        return 0
+
+    checks = [
+        (
+            "HIGH",
+            reference["high"],
+            previous_price <= reference["high"]
+            and current_price > reference["high"],
+            "ABOVE",
+        ),
+        (
+            "LOW",
+            reference["low"],
+            previous_price >= reference["low"]
+            and current_price < reference["low"],
+            "BELOW",
+        ),
+    ]
+
+    sent = 0
+
+    for level_name, level, crossed, direction in checks:
+        if not crossed:
+            continue
+
+        if breakout_already_sent(
+            con,
+            day,
+            current_session,
+            reference_session,
+            direction,
+        ):
+            continue
+
+        telegram_send(
+            breakout_message(
+                current_session,
+                reference_session,
+                level_name,
+                level,
+                current_price,
+            )
+        )
+
+        mark_breakout(
+            con,
+            day,
+            current_session,
+            reference_session,
+            direction,
+        )
+
+        sent += 1
+
+    return sent
+
+
+# -----------------------------
+# 15m aggregation / previous-day breakouts
+# -----------------------------
+def aggregate_15m_from_5m(rows):
+    buckets = {}
+
+    for row in rows:
+        bucket_minute = (row["dt"].minute // 15) * 15
+        bucket_dt = row["dt"].replace(
+            minute=bucket_minute,
+            second=0,
+            microsecond=0,
+        )
+
+        if bucket_dt not in buckets:
+            buckets[bucket_dt] = {
+                "dt": bucket_dt,
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["close"],
+                "last_dt": row["dt"],
+            }
+        else:
+            b = buckets[bucket_dt]
+            b["high"] = max(b["high"], row["high"])
+            b["low"] = min(b["low"], row["low"])
+
+            if row["dt"] >= b["last_dt"]:
+                b["close"] = row["close"]
+                b["last_dt"] = row["dt"]
+
+    now = datetime.now(TZ)
+    output = []
+
+    for bucket_dt, b in sorted(buckets.items()):
+        if bucket_dt + timedelta(minutes=15) <= now:
+            output.append(
+                {
+                    "dt": bucket_dt,
+                    "open": b["open"],
+                    "high": b["high"],
+                    "low": b["low"],
+                    "close": b["close"],
+                }
+            )
+
+    return output
+
+
+def previous_day_breakout_alerts(
+    con,
+    previous_day,
+    previous_day_data,
+    candles15,
+):
+    if not candles15:
+        return 0
+
+    close = candles15[-1]["close"]
+    sent = 0
+
+    if close > previous_day_data["high"]:
+        exists = con.execute(
+            """
+            SELECT 1 FROM level_alerts
+            WHERE market_day=? AND level_name=? AND direction=?
+            """,
+            (
+                str(previous_day),
+                "HIGH",
+                "ABOVE",
+            ),
+        ).fetchone()
+
+        if not exists:
+            telegram_send(
+                "🚨 XAUUSD — PREVIOUS DAY HIGH BROKEN\n\n"
+                f"🎯 Level: {fmt_price(previous_day_data['high'])}\n"
+                f"💰 15m Close: {fmt_price(close)}\n\n"
+                "✅ Confirmed by 15m candle close."
+            )
+
+            con.execute(
+                "INSERT INTO level_alerts VALUES (?, ?, ?, ?)",
+                (
+                    str(previous_day),
+                    "HIGH",
+                    "ABOVE",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+            con.commit()
+            sent += 1
+
+    if close < previous_day_data["low"]:
+        exists = con.execute(
+            """
+            SELECT 1 FROM level_alerts
+            WHERE market_day=? AND level_name=? AND direction=?
+            """,
+            (
+                str(previous_day),
+                "LOW",
+                "BELOW",
+            ),
+        ).fetchone()
+
+        if not exists:
+            telegram_send(
+                "🚨 XAUUSD — PREVIOUS DAY LOW BROKEN\n\n"
+                f"🎯 Level: {fmt_price(previous_day_data['low'])}\n"
+                f"💰 15m Close: {fmt_price(close)}\n\n"
+                "✅ Confirmed by 15m candle close."
+            )
+
+            con.execute(
+                "INSERT INTO level_alerts VALUES (?, ?, ?, ?)",
+                (
+                    str(previous_day),
+                    "LOW",
+                    "BELOW",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+            con.commit()
+            sent += 1
+
+    return sent
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+# -----------------------------
+# MT Market Ideas / Order Block engine
+# -----------------------------
+def average_true_range(rows, period=14):
+    if len(rows) < period + 1:
+        return None
+
+    trs = []
+    for i in range(1, len(rows)):
+        high = rows[i]["high"]
+        low = rows[i]["low"]
+        prev_close = rows[i - 1]["close"]
+        trs.append(max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
         ))
+
+    return sum(trs[-period:]) / period
+
+
+def detect_order_blocks(rows):
+    """
+    Conservative 5m order-block detector.
+
+    Bullish OB:
+      bearish candle immediately before strong bullish displacement
+      that closes above a recent swing high.
+
+    Bearish OB:
+      bullish candle immediately before strong bearish displacement
+      that closes below a recent swing low.
+    """
+    if len(rows) < 40:
+        return []
+
+    atr = average_true_range(rows, 14)
+    if not atr or atr <= 0:
+        return []
+
+    zones = []
+    start = max(20, len(rows) - 80)
+
+    for i in range(start, len(rows) - 1):
+        ob = rows[i]
+        impulse = rows[i + 1]
+
+        body = abs(impulse["close"] - impulse["open"])
+        if body < 1.5 * atr:
+            continue
+
+        recent = rows[max(0, i - 12):i]
+        if len(recent) < 8:
+            continue
+
+        recent_high = max(x["high"] for x in recent)
+        recent_low = min(x["low"] for x in recent)
+
+        if (
+            ob["close"] < ob["open"]
+            and impulse["close"] > impulse["open"]
+            and impulse["close"] > recent_high
+        ):
+            zones.append({
+                "type": "BULLISH",
+                "low": ob["low"],
+                "high": ob["open"],
+                "origin_dt": ob["dt"],
+                "impulse_dt": impulse["dt"],
+            })
+
+        if (
+            ob["close"] > ob["open"]
+            and impulse["close"] < impulse["open"]
+            and impulse["close"] < recent_low
+        ):
+            zones.append({
+                "type": "BEARISH",
+                "low": ob["open"],
+                "high": ob["high"],
+                "origin_dt": ob["dt"],
+                "impulse_dt": impulse["dt"],
+            })
+
+    zones.sort(key=lambda z: z["impulse_dt"], reverse=True)
+    return zones[:8]
+
+
+def structure_shift(rows, direction):
+    if len(rows) < 8:
+        return False
+
+    recent = rows[-4:]
+    previous = rows[-8:-4]
+
+    if direction == "LONG":
+        return (
+            recent[-1]["close"] > max(x["high"] for x in previous)
+            and recent[-1]["close"] > recent[-2]["close"]
+        )
+
+    return (
+        recent[-1]["close"] < min(x["low"] for x in previous)
+        and recent[-1]["close"] < recent[-2]["close"]
+    )
+
+
+def setup_targets(entry, direction, previous_day, sessions):
+    candidates = []
+
+    if direction == "LONG":
+        candidates.append(("Previous Day High", previous_day["high"]))
+        for name, data in sessions.items():
+            if data and data["high"] > entry:
+                candidates.append((f"{name.title()} High", data["high"]))
+        candidates = [(n, p) for n, p in candidates if p > entry]
+        candidates.sort(key=lambda x: x[1])
+    else:
+        candidates.append(("Previous Day Low", previous_day["low"]))
+        for name, data in sessions.items():
+            if data and data["low"] < entry:
+                candidates.append((f"{name.title()} Low", data["low"]))
+        candidates = [(n, p) for n, p in candidates if p < entry]
+        candidates.sort(key=lambda x: x[1], reverse=True)
+
+    return candidates
+
+
+def select_trade_plan(entry_zone, direction, previous_day, sessions, atr):
+    if not atr or atr <= 0:
+        return None
+
+    entry_low = entry_zone["low"]
+    entry_high = entry_zone["high"]
+    entry = (entry_low + entry_high) / 2
+
+    if direction == "LONG":
+        sl = entry_low - 0.35 * atr
+    else:
+        sl = entry_high + 0.35 * atr
+
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return None
+
+    valid = []
+    for name, target in setup_targets(
+        entry, direction, previous_day, sessions
+    ):
+        rr = abs(target - entry) / risk
+        if rr >= 2.0:
+            valid.append((name, target, rr))
+
+    if not valid:
+        return None
+
+    tp1 = valid[0]
+    tp2 = valid[-1]
+
+    return {
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "sl": sl,
+        "tp1_name": tp1[0],
+        "tp1": tp1[1],
+        "rr1": tp1[2],
+        "tp2_name": tp2[0],
+        "tp2": tp2[1],
+        "rr2": tp2[2],
+    }
+
+
+def market_idea_message(direction, grade, trend, zone, plan):
+    side = "🟢 POTENTIAL LONG" if direction == "LONG" else "🔴 POTENTIAL SHORT"
+
+    return (
+        "🧠 MT MARKET IDEA\n\n"
+        f"{side}\n"
+        f"⭐ QUALITY: {grade}\n"
+        f"📈 MARKET TREND: {trend}\n\n"
+        "📦 ORDER BLOCK\n"
+        f"{fmt_price(zone['low'])} — {fmt_price(zone['high'])}\n\n"
+        "📍 ENTRY ZONE\n"
+        f"{fmt_price(plan['entry_low'])} — {fmt_price(plan['entry_high'])}\n\n"
+        f"🛑 SL: {fmt_price(plan['sl'])}\n\n"
+        f"🎯 TP1: {fmt_price(plan['tp1'])} ({plan['tp1_name']})\n"
+        f"🎯 R:R: 1:{plan['rr1']:.2f}\n\n"
+        f"🎯 TP2: {fmt_price(plan['tp2'])} ({plan['tp2_name']})\n"
+        f"🎯 R:R: 1:{plan['rr2']:.2f}\n\n"
+        "🧭 LOGIC\n"
+        "• Trend-aligned setup\n"
+        "• Order block + displacement\n"
+        "• Price interacting with the OB\n"
+        "• R:R minimum 1:2\n\n"
+        "⚠️ Scenario, not a guaranteed trade.\n"
+        "Wait for confirmation before acting."
+    )
+
+
+def maybe_market_idea(con, day, rows, previous_day, sessions, trend):
+    """
+    At most one fresh A+ scenario per detected OB/day.
+    Never fights the trend.
+    Requires:
+      - current price inside a recent aligned OB
+      - 5m structure shift
+      - minimum R:R 1:2
+    """
+    if trend not in {"BULLISH", "BEARISH"}:
+        return 0
+
+    if len(rows) < 40:
+        return 0
+
+    price = rows[-1]["close"]
+    atr = average_true_range(rows, 14)
+    zones = detect_order_blocks(rows)
+
+    if not zones:
+        return 0
+
+    desired = "BULLISH" if trend == "BULLISH" else "BEARISH"
+    direction = "LONG" if trend == "BULLISH" else "SHORT"
+
+    for zone in zones:
+        if zone["type"] != desired:
+            continue
+
+        if not (zone["low"] <= price <= zone["high"]):
+            continue
+
+        if not structure_shift(rows, direction):
+            continue
+
+        plan = select_trade_plan(
+            zone,
+            direction,
+            previous_day,
+            sessions,
+            atr,
+        )
+
+        if not plan:
+            continue
+
+        setup_key = (
+            f"{direction}|"
+            f"{zone['origin_dt'].isoformat()}|"
+            f"{zone['impulse_dt'].isoformat()}"
+        )
+
+        already = con.execute(
+            """
+            SELECT 1 FROM market_idea_alerts
+            WHERE market_day=? AND setup_key=?
+            """,
+            (str(day), setup_key),
+        ).fetchone()
+
+        if already:
+            continue
+
+        telegram_send(
+            market_idea_message(
+                direction,
+                "A+",
+                trend,
+                zone,
+                plan,
+            )
+        )
+
+        con.execute(
+            "INSERT INTO market_idea_alerts VALUES (?, ?, ?)",
+            (
+                str(day),
+                setup_key,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
         con.commit()
 
-        # Release alert when Actual becomes available.
-        if e["actual"] and now >= e["dt"]:
-            already_released = con.execute(
-                "SELECT 1 FROM released_events WHERE event_key=?",
-                (key,),
-            ).fetchone()
+        return 1
 
-            if not already_released:
-                telegram_send(
-                    release_alert(e, score, reasons)
-                )
-                con.execute(
-                    "INSERT INTO released_events VALUES (?, ?)",
-                    (key, datetime.now(timezone.utc).isoformat()),
-                )
-                con.commit()
-                release_sent += 1
+    return 0
+
+def main():
+    con = db_connect()
+    now = datetime.now(TZ)
+    today = now.date()
+
+    # Weekend: do absolutely nothing.
+    if today.weekday() >= 5:
+        print(
+            f"Weekend {today.isoformat()} — bot is inactive."
+        )
+        return
+
+    # The economic calendar is independent from the market-data request below.
+    # A Twelve Data outage must not make a scheduled news alert disappear.
+    try:
+        news_upcoming, news_released = process_economic_calendar(con, now)
+    except requests.RequestException as exc:
+        news_upcoming = 0
+        news_released = 0
+        print(f"Economic calendar refresh failed: {exc}")
+    except RuntimeError as exc:
+        news_upcoming = 0
+        news_released = 0
+        print(f"Economic calendar refresh failed: {exc}")
+
+    # --------------------------------------------------------
+    # Determine previous trading day.
+    # Monday -> Friday.
+    # --------------------------------------------------------
+    previous_day = previous_weekday(today)
+
+    # --------------------------------------------------------
+    # Load EXACT previous trading day window:
+    # previous_day-1 at 23:00 -> previous_day at 23:00.
+    # This is the user's definition of Previous Day.
+    # --------------------------------------------------------
+    previous_day_data, previous_rows = daily_range_for_label(
+        previous_day
+    )
+
+    if not previous_day_data:
+        print(
+            f"No intraday data for Previous Day {previous_day}."
+        )
+        return
+
+    # --------------------------------------------------------
+    # Current-day sessions are completely independent.
+    # We request current calendar day's 5m data only.
+    # --------------------------------------------------------
+    today_start = datetime.combine(
+        today,
+        time(0, 0),
+        tzinfo=TZ,
+    )
+    today_end = now
+
+    today_rows = load_5m_window(today_start, today_end)
+
+    sessions = all_sessions_for_day(today_rows, today)
+
+    # --------------------------------------------------------
+    # Trend: latest completed weekday daily ranges.
+    # Use exact 23:00->23:00 windows, not provider 1D candles.
+    # --------------------------------------------------------
+    trend_days = []
+
+    cursor = previous_day
+
+    for _ in range(5):
+        data, _ = daily_range_for_label(cursor)
+
+        if data:
+            trend_days.append(
+                {
+                    "high": data["high"],
+                    "low": data["low"],
+                    "equilibrium": data["equilibrium"],
+                    "close": data["close"],
+                }
+            )
+
+        cursor = previous_weekday(cursor)
+
+    trend_days = list(reversed(trend_days))
+
+    trend, reason = trend_from_daily_ranges(trend_days)
+
+    # --------------------------------------------------------
+    # Daily report:
+    #
+    # After 23:00, report the just-completed trading day itself.
+    # Before 23:00, recovery report is for the previous trading day.
+    # This means Monday can recover Friday's report if needed.
+    # --------------------------------------------------------
+    if now.hour >= 23:
+        report_day = today
+        report_data, _ = daily_range_for_label(report_day)
+        report_sessions = all_sessions_for_day(today_rows, today)
+    else:
+        report_day = previous_day
+        report_data = previous_day_data
+
+        previous_start, previous_end = trading_day_window(
+            report_day
+        )
+
+        report_rows, _unused = daily_range_for_label(report_day)
+        report_sessions = {
+            name: session_range_for_day(
+                previous_rows,
+                report_day,
+                name,
+            )
+            for name in ("ASIA", "LONDON", "NEW YORK")
+        }
+
+    daily_sent = False
+
+    if report_data:
+        daily_sent = send_daily_report(
+            con,
+            report_day,
+            report_data,
+            report_sessions,
+            trend,
+            reason,
+        )
+
+    # --------------------------------------------------------
+    # Current price.
+    # Use the latest current-day 5m close.
+    # --------------------------------------------------------
+    current_price = (
+        today_rows[-1]["close"] if today_rows else None
+    )
+
+    eq_alerts = 0
+    breakout_alerts = 0
+    previous_day_breakouts = 0
+
+    if current_price is not None:
+        # Equilibrium = Previous Trading Day 50%.
+        eq_alerts = check_equilibrium_zone(
+            con,
+            previous_day,
+            previous_day_data["equilibrium"],
+            current_price,
+        )
+
+        # Session breakouts:
+        # London -> today's Asia
+        # New York -> today's London
+        previous_price_row = con.execute(
+            "SELECT last_price FROM session_breakout_state WHERE market_day=?",
+            (str(today),),
+        ).fetchone()
+
+        previous_price = (
+            float(previous_price_row[0])
+            if previous_price_row
+            else None
+        )
+
+        breakout_alerts = check_session_breakouts(
+            con,
+            today,
+            sessions,
+            current_price,
+            previous_price,
+            now,
+        )
+
+        con.execute(
+            """
+            INSERT INTO session_breakout_state
+                (market_day, last_price, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(market_day) DO UPDATE SET
+                last_price=excluded.last_price,
+                updated_at=excluded.updated_at
+            """,
+            (
+                str(today),
+                current_price,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+        con.commit()
+
+        # Previous Day HIGH/LOW breakout -> completed 15m close.
+        candles15 = aggregate_15m_from_5m(today_rows)
+
+        previous_day_breakouts = previous_day_breakout_alerts(
+            con,
+            previous_day,
+            previous_day_data,
+            candles15,
+        )
+
+    # --------------------------------------------------------
+    # MT MARKET IDEA
+    # Trend -> Order Block -> Structure Shift -> R:R >= 1:2
+    # --------------------------------------------------------
+    market_ideas = maybe_market_idea(
+        con,
+        today,
+        today_rows,
+        previous_day_data,
+        sessions,
+        trend,
+    )
+
+    session_count = sum(
+        1
+        for v in sessions.values()
+        if v is not None
+    )
 
     print(
-        f"Checked {len(all_events)} Medium/High events. "
-        f"XAUUSD-qualified: {len(xau_events)}. "
-        f"Sent {pre_sent} pre-alert(s), "
-        f"{updates_sent} update(s), "
-        f"{release_sent} release alert(s)."
+        f"Previous trading day: {previous_day}. "
+        f"Previous Day HIGH: {fmt_price(previous_day_data['high'])}. "
+        f"Previous Day LOW: {fmt_price(previous_day_data['low'])}. "
+        f"Equilibrium: {fmt_price(previous_day_data['equilibrium'])}. "
+        f"Current date: {today}. "
+        f"Report day: {report_day}. "
+        f"Daily report sent: {daily_sent}. "
+        f"Sessions calculated for {today}: {session_count}/3. "
+        f"Equilibrium alerts: {eq_alerts}. "
+        f"Session breakout alerts: {breakout_alerts}. "
+        f"Previous-day breakout alerts: {previous_day_breakouts}. "
+        f"Market ideas: {market_ideas}. "
+        f"Economic-news alerts: upcoming {news_upcoming}, released {news_released}. "
+        f"Latest XAU/USD: "
+        f"{fmt_price(current_price) if current_price is not None else 'N/A'}."
     )
 
 
