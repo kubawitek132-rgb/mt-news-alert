@@ -44,13 +44,11 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 THREAD_ID = int(os.environ["TELEGRAM_MESSAGE_THREAD_ID"])
 TWELVE_API_KEY = os.environ["TWELVE_DATA_API_KEY"]
-# Trading Economics calendar API key.  This is intentionally optional so an
-# unavailable calendar provider never stops the XAUUSD market report.
-TRADING_ECONOMICS_API_KEY = os.getenv("TRADING_ECONOMICS_API_KEY", "").strip()
 
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Warsaw"))
 SYMBOL = os.getenv("XAU_SYMBOL", "XAU/USD")
-DB = "about_market_state.db"
+# Keep alert deduplication in the state file already used by this repository.
+DB = os.getenv("STATE_DB", "stan.db")
 
 SESSIONS = {
     "ASIA": (1, 8),
@@ -169,7 +167,7 @@ def telegram_send(text):
 # -----------------------------
 # Economic calendar / XAUUSD news alerts
 # -----------------------------
-NEWS_COUNTRY = "United States"
+NEWS_CURRENCY = "USD"
 NEWS_PRE_ALERT_MINUTES = 20
 NEWS_RELEASE_LOOKBACK_MINUTES = 180
 
@@ -179,6 +177,13 @@ def _calendar_value(value):
     if value is None or str(value).strip().lower() in {"", "null", "none", "-"}:
         return "N/A"
     return str(value).strip()
+
+
+def _event_value(event, *names):
+    for name in names:
+        if name in event:
+            return event[name]
+    return None
 
 
 def _calendar_datetime(value):
@@ -200,7 +205,7 @@ def _calendar_datetime(value):
 
 
 def _is_high_impact(event):
-    importance = event.get("Importance", event.get("importance"))
+    importance = _event_value(event, "impact", "Importance", "importance")
     if isinstance(importance, (int, float)):
         return importance >= 3
     return str(importance or "").strip().lower() in {"high", "3", "3.0"}
@@ -210,8 +215,8 @@ def _calendar_event_key(event, event_dt):
     return "|".join(
         (
             event_dt.astimezone(timezone.utc).isoformat(),
-            str(event.get("Country", event.get("country", ""))).strip(),
-            str(event.get("Event", event.get("event", ""))).strip(),
+            str(_event_value(event, "country", "Country") or "").strip(),
+            str(_event_value(event, "title", "Event", "event") or "").strip(),
         )
     )
 
@@ -237,33 +242,26 @@ def mark_calendar_alert_sent(con, event_key, alert_type):
     con.commit()
 
 
-def fetch_us_economic_calendar(now):
-    """Fetch a rolling UTC window so delayed workflow starts remain covered."""
-    if not TRADING_ECONOMICS_API_KEY:
-        return []
-
-    start = (now - timedelta(hours=3)).astimezone(timezone.utc).date().isoformat()
-    end = (now + timedelta(days=2)).astimezone(timezone.utc).date().isoformat()
+def fetch_economic_calendar():
+    """Fetch Forex Factory's public current-week economic calendar feed."""
     response = requests.get(
-        "https://api.tradingeconomics.com/calendar/country/united%20states/"
-        f"{start}/{end}",
-        params={"c": TRADING_ECONOMICS_API_KEY, "f": "json"},
+        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
         timeout=20,
     )
     response.raise_for_status()
     data = response.json()
     if not isinstance(data, list):
-        raise RuntimeError(f"Unexpected calendar response: {data}")
+        raise RuntimeError(f"Unexpected public calendar response: {data}")
     return data
 
 
 def _upcoming_news_message(event, event_dt):
     return (
         "🔔 XAUUSD — UPCOMING HIGH-IMPACT USD NEWS\n\n"
-        f"🇺🇸 {_calendar_value(event.get('Event', event.get('event')))}\n"
+        f"🇺🇸 {_calendar_value(_event_value(event, 'title', 'Event', 'event'))}\n"
         f"⏰ {event_dt.strftime('%d %b %Y, %H:%M')} Europe/Warsaw\n"
-        f"📊 Forecast: {_calendar_value(event.get('Forecast', event.get('forecast')))}\n"
-        f"📌 Previous: {_calendar_value(event.get('Previous', event.get('previous')))}\n\n"
+        f"📊 Forecast: {_calendar_value(_event_value(event, 'forecast', 'Forecast'))}\n"
+        f"📌 Previous: {_calendar_value(_event_value(event, 'previous', 'Previous'))}\n\n"
         "🟡 XAUUSD relevance: high — expect elevated volatility."
     )
 
@@ -271,30 +269,26 @@ def _upcoming_news_message(event, event_dt):
 def _released_news_message(event, event_dt):
     return (
         "📰 XAUUSD — HIGH-IMPACT USD DATA RELEASED\n\n"
-        f"🇺🇸 {_calendar_value(event.get('Event', event.get('event')))}\n"
+        f"🇺🇸 {_calendar_value(_event_value(event, 'title', 'Event', 'event'))}\n"
         f"⏰ {event_dt.strftime('%d %b %Y, %H:%M')} Europe/Warsaw\n"
-        f"✅ Actual: {_calendar_value(event.get('Actual', event.get('actual')))}\n"
-        f"📊 Forecast: {_calendar_value(event.get('Forecast', event.get('forecast')))}\n"
-        f"📌 Previous: {_calendar_value(event.get('Previous', event.get('previous')))}\n\n"
+        f"✅ Actual: {_calendar_value(_event_value(event, 'actual', 'Actual'))}\n"
+        f"📊 Forecast: {_calendar_value(_event_value(event, 'forecast', 'Forecast'))}\n"
+        f"📌 Previous: {_calendar_value(_event_value(event, 'previous', 'Previous'))}\n\n"
         "🟡 Watch XAUUSD price action and USD reaction; this is not a trade signal."
     )
 
 
 def process_economic_calendar(con, now):
     """Send one pre-release and one released-data alert for each relevant event."""
-    if not TRADING_ECONOMICS_API_KEY:
-        print("Economic calendar disabled: missing TRADING_ECONOMICS_API_KEY.")
-        return 0, 0
-
     upcoming_sent = 0
     released_sent = 0
-    events = fetch_us_economic_calendar(now)
+    events = fetch_economic_calendar()
 
     for event in events:
-        country = str(event.get("Country", event.get("country", ""))).strip()
-        event_dt = _calendar_datetime(event.get("Date", event.get("date")))
-        event_name = _calendar_value(event.get("Event", event.get("event")))
-        if country != NEWS_COUNTRY or not event_dt or event_name == "N/A":
+        currency = str(_event_value(event, "country", "Country") or "").strip()
+        event_dt = _calendar_datetime(_event_value(event, "date", "Date"))
+        event_name = _calendar_value(_event_value(event, "title", "Event", "event"))
+        if currency != NEWS_CURRENCY or not event_dt or event_name == "N/A":
             continue
         if not _is_high_impact(event):
             continue
@@ -310,7 +304,7 @@ def process_economic_calendar(con, now):
             mark_calendar_alert_sent(con, event_key, "upcoming")
             upcoming_sent += 1
 
-        actual = _calendar_value(event.get("Actual", event.get("actual")))
+        actual = _calendar_value(_event_value(event, "actual", "Actual"))
         if (
             -NEWS_RELEASE_LOOKBACK_MINUTES <= minutes_until < 0
             and actual != "N/A"
